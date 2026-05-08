@@ -1,374 +1,362 @@
 <?php
 require_once 'config.php';
-require_role('student');
+require_student();
+$studentId = current_user_id();
 
-$user_id = isset($_SESSION['user_id']) ? (int)$_SESSION['user_id'] : 0;
-$message = '';
-
-// 1. MARK NOTIFICATIONS AS READ LOGIC (Action Handler)
-
-if (isset($_GET['action']) && $_GET['action'] === 'mark_read' && isset($_GET['ids']) && !empty($_GET['ids'])) {
-    // Sanitize the IDs string: ensures it only contains numbers and commas
-    $ids_string = preg_replace('/[^0-9,]/', '', $_GET['ids']);
-
-    if (!empty($ids_string) && isset($_SESSION['user_id'])) {
-        try {
-            $user_id_int = (int)$_SESSION['user_id'];
-            
-            // This is the core update query
-            $sql = "UPDATE notifications 
-                    SET is_read = 1 
-                    WHERE id IN ({$ids_string}) 
-                    AND (target_user_id = :user_id OR target_role = 'student' OR target_role = 'all')";
-            
-            $stmt = $pdo->prepare($sql);
-            $stmt->bindParam(':user_id', $user_id_int, PDO::PARAM_INT);
-            
-            $stmt->execute();
-            
-        } catch (PDOException $e) {
-            // Log error
-            // error_log("Notification Mark Read DB Error: " . $e->getMessage()); 
-        }
-    }
-    
-    // Redirect back to clean URL
-    header("Location: student_dashboard.php");
-    exit();
-}
-
-
-// Handle Join Code Submission 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'join_quiz') {
-    $join_code = trim(strtoupper($_POST['join_code'] ?? ''));
-    
-    if (empty($join_code)) {
-        $message = "⚠️ Please enter a valid join code.";
-    } else {
-        // Find the quiz by join code
-        $quiz_stmt = $pdo->prepare("SELECT id FROM quizzes WHERE join_code = ? AND is_active = 1");
-        $quiz_stmt->execute([$join_code]);
-        $quiz = $quiz_stmt->fetch();
-        
-        if ($quiz) {
-            redirect('quiz.php?quiz_id=' . $quiz['id']);
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    if ($action === 'join_by_code') {
+        $code = trim(strtoupper($_POST['subject_code'] ?? ''));
+        $subject = $pdo->prepare("SELECT id FROM subjects WHERE subject_code = ? AND is_active = 1");
+        $subject->execute([$code]);
+        $row = $subject->fetch();
+        if ($row) {
+            $subjectId = (int)$row['id'];
+            $pdo->prepare("
+                INSERT INTO subject_join_requests (subject_id, student_id, status)
+                VALUES (?, ?, 'pending')
+                ON DUPLICATE KEY UPDATE status = 'pending', requested_at = NOW()
+            ")->execute([$subjectId, $studentId]);
+            set_flash('success', 'Join request sent to teacher.');
         } else {
-            $message = "⚠️ Invalid or inactive join code.";
+            set_flash('error', 'Invalid subject code.');
+        }
+    } elseif ($action === 'request_subject') {
+        $subjectId = (int)($_POST['subject_id'] ?? 0);
+        $pdo->prepare("
+            INSERT INTO subject_join_requests (subject_id, student_id, status)
+            VALUES (?, ?, 'pending')
+            ON DUPLICATE KEY UPDATE status = 'pending', requested_at = NOW()
+        ")->execute([$subjectId, $studentId]);
+        set_flash('success', 'Request sent.');
+    }
+    redirect('student_dashboard.php');
+}
+
+$flash = get_flash();
+$subjects = $pdo->prepare("
+    SELECT s.id, s.name, s.description, s.subject_code, u.name AS teacher_name
+    FROM subject_enrollments se
+    INNER JOIN subjects s ON s.id = se.subject_id
+    INNER JOIN users u ON u.id = s.teacher_id
+    WHERE se.student_id = ? AND se.status = 'approved'
+    ORDER BY s.name
+");
+$subjects->execute([$studentId]);
+$enrolledSubjects = $subjects->fetchAll();
+
+$availableSubjects = $pdo->prepare("
+    SELECT s.id, s.name, s.description, s.subject_code, u.name AS teacher_name
+    FROM subjects s
+    INNER JOIN users u ON u.id = s.teacher_id
+    WHERE s.is_active = 1
+      AND s.id NOT IN (SELECT subject_id FROM subject_enrollments WHERE student_id = ? AND status = 'approved')
+    ORDER BY s.name
+");
+$availableSubjects->execute([$studentId]);
+$discoverSubjects = $availableSubjects->fetchAll();
+
+$quizzes = $pdo->prepare("
+    SELECT q.id, q.title, q.description, q.time_limit, q.attempt_limit, s.name AS subject_name
+    FROM quizzes q
+    INNER JOIN subject_enrollments se ON se.subject_id = q.subject_id AND se.student_id = ? AND se.status = 'approved'
+    INNER JOIN subjects s ON s.id = q.subject_id
+    WHERE q.is_active = 1
+    ORDER BY q.created_at DESC
+");
+$quizzes->execute([$studentId]);
+$quizRows = $quizzes->fetchAll();
+
+$attempts = $pdo->prepare("
+    SELECT qa.score, qa.total_points, qa.submitted_at, q.title AS quiz_title
+    FROM quiz_attempts qa
+    INNER JOIN quizzes q ON q.id = qa.quiz_id
+    WHERE qa.student_id = ? AND qa.is_finished = 1
+    ORDER BY qa.submitted_at DESC
+");
+$attempts->execute([$studentId]);
+$attemptRows = $attempts->fetchAll();
+
+$stmtPending = $pdo->prepare("SELECT COUNT(*) FROM subject_join_requests WHERE student_id = ? AND status = 'pending'");
+$stmtPending->execute([$studentId]);
+$studentPendingRequests = (int)$stmtPending->fetchColumn();
+
+$studentAvgPct = null;
+if ($attemptRows) {
+    $acc = 0.0;
+    $n = 0;
+    foreach ($attemptRows as $a) {
+        $tp = (int)$a['total_points'];
+        if ($tp > 0) {
+            $acc += ((float)$a['score'] / $tp) * 100;
+            $n++;
         }
     }
-}
-// (Code ends after handling join quiz POST request)
-
-
-// 2. FETCH UNREAD NOTIFICATIONS LOGIC
-
-$notifications = []; 
-try {
-    // CRITICAL: This query must match the WHERE clause logic of the mark_read action
-    $notif_stmt = $pdo->prepare("
-        SELECT * FROM notifications 
-        WHERE (target_role = 'student' OR target_user_id = ? OR target_role = 'all') 
-        AND is_read = 0 
-        ORDER BY created_at DESC 
-        LIMIT 5
-    ");
-    // Execute using the user ID defined near the top
-    $notif_stmt->execute([$user_id]);
-    $notifications = $notif_stmt->fetchAll();
-    
-} catch (PDOException $e) {
-    // Handle database error if necessary
-}
-
-$notification_count = count($notifications);
-
-
-
-// CRITICAL FIX: Only show ACTIVE AND PUBLIC quizzes (where join_code is NULL)
-$quizzes = $pdo->query("SELECT * FROM quizzes WHERE is_active = 1 AND join_code IS NULL")->fetchAll();
-
-// Ranking Logic (Top 10)
-// This query uses the duration_seconds calculated from the fixed database schema
-$ranking = []; 
-try {
-    $ranking_stmt = $pdo->query("
-        SELECT 
-            u.name, 
-            q.title AS quiz_title,
-            TIMESTAMPDIFF(SECOND, r.start_time, r.end_time) AS duration_seconds,
-            r.score
-        FROM results r
-        JOIN users u ON r.user_id = u.id
-        JOIN quizzes q ON r.quiz_id = q.id
-        WHERE r.is_finished = 1 AND u.role = 'student'
-        ORDER BY r.score DESC, duration_seconds ASC 
-        LIMIT 10
-    ");
-    $ranking = $ranking_stmt->fetchAll(); 
-} catch (PDOException $e) {
-    // Error handling is less critical now that the schema is fixed
-}
-
-
-//Printables Logic: Find quizzes student has finished 
-$completed_quizzes = [];
-try {
-    $completed_quizzes_stmt = $pdo->prepare("
-        SELECT DISTINCT q.id, q.title
-        FROM results r
-        JOIN quizzes q ON r.quiz_id = q.id
-        WHERE r.user_id = ? AND r.is_finished = 1
-        ORDER BY q.title ASC
-    ");
-    $completed_quizzes_stmt->execute([$user_id]);
-    $completed_quizzes = $completed_quizzes_stmt->fetchAll();
-} catch (PDOException $e) {
-   
-}
-
-
-// Quotes for top students
-$quotes = [
-    "A journey of a thousand miles begins with a single step.",
-    "The mind is everything. What you think you become.",
-    "Believe you can and you're halfway there.",
-    "The best way to predict the future is to create it. <3",
-    "Nothing is impossible if hindi ka tamad mag study!",
-    "WOW BERRY GOOD NAG STUDY ANG FERSON :)",
-    "SANA IPAGPATULOY MO ANG IYONG PAGIGING MASIPAG NA BATA INENG OR INONG BASTA IKAW TINUTUKOY KO"         
-];
-
-// START PHP LOGIC FOR POST-QUIZ DISPLAY
-
-$display_quote_and_results = false;
-$random_quote = '';
-
-if (isset($_SESSION['quiz_submitted']) && $_SESSION['quiz_submitted']) {
-    // 1. Retrieve data stored in session by quiz.php
-    $last_quiz_score = $_SESSION['last_quiz_score'] ?? 0;
-    $last_quiz_total = $_SESSION['last_quiz_total'] ?? 0;
-    $last_quiz_title = $_SESSION['last_quiz_title'] ?? 'Quiz';
-    
-    // 2. AWARD LOGIC: Determine if stars are awarded (80% threshold)
-    $passing_threshold = 0.8; // 80% score or better
-    $score_percentage = ($last_quiz_total > 0) ? ($last_quiz_score / $last_quiz_total) : 0;
-    $award_stars = $score_percentage >= $passing_threshold;
-    
-    // 3. Pick a random quote
-    $random_key = array_rand($quotes);
-    $random_quote = $quotes[$random_key];
-    
-    $display_quote_and_results = true;
-    
-    // 4. Clear session flags to prevent repeated display on refresh
-    unset($_SESSION['quiz_submitted']);
-    unset($_SESSION['last_quiz_score']);
-    unset($_SESSION['last_quiz_total']);
-    unset($_SESSION['last_quiz_title']);
+    if ($n > 0) {
+        $studentAvgPct = (int)round($acc / $n);
+    }
 }
 ?>
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Student Dashboard - Quiz System</title>
-<link rel="stylesheet" href="styles.css">
-<link rel="stylesheet" href="modal.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Student Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
 </head>
-<body class="student">
-<div class="header">
-    <div class="header-left">
-        <h2>Welcome, <?php echo e($_SESSION['name']); ?>!</h2>
-    </div>
-    <div class="header-actions">
-        <div class="notification-container">
-            <a href="#" id="notification-bell" class="notification-button" title="Announcements">
-                <i class="fas fa-bell"></i>
-                <?php if ($notification_count > 0): ?>
-                    <span class="notification-badge"><?php echo $notification_count; ?></span>
-                <?php endif; ?>
-            </a>
+<body class="teacher-page student-dashboard">
+<div class="teacher-layout student-layout">
+    <aside class="teacher-sidebar student-sidebar">
+        <div class="teacher-sidebar-brand">Student Panel</div>
+        <div class="student-nav-rail" role="navigation" aria-label="Student workspace">
+            <a href="student_dashboard.php#section-overview" class="teacher-nav-item active" data-target="section-overview">Overview</a>
+            <a href="student_dashboard.php#section-join" class="teacher-nav-item" data-target="section-join">Join by Code</a>
+            <a href="student_dashboard.php#section-discover" class="teacher-nav-item" data-target="section-discover">Discover Subjects</a>
+            <a href="student_dashboard.php#section-subjects" class="teacher-nav-item" data-target="section-subjects">My Subjects</a>
+            <a href="student_dashboard.php#section-quizzes" class="teacher-nav-item" data-target="section-quizzes">Available Quizzes</a>
+            <a href="student_dashboard.php#section-results" class="teacher-nav-item" data-target="section-results">My Results</a>
+            <a href="student_profile.php" class="teacher-nav-item teacher-nav-profile">Profile</a>
+        </div>
+    </aside>
 
-            <div id="notification-dropdown" class="notification-dropdown-content">
-                <?php if (!empty($notifications)): ?>
-                    <h3>🚨 New Announcements (<?php echo $notification_count; ?>)</h3>
-                    <?php foreach ($notifications as $notification): ?>
-                        <div class="notification-item">
-                            <strong>[<?php echo e(date('M d', strtotime($notification['created_at']))); ?>]</strong> 
-                            <?php echo e($notification['content']); ?>
+    <main class="teacher-main">
+        <div class="header teacher-header">
+            <div>
+                <h2>Student Workspace</h2>
+                <p class="teacher-subtitle">Join subjects, take quizzes, and monitor your results.</p>
+            </div>
+        </div>
+
+        <div class="container wide teacher-wrap">
+            <?php if ($flash): ?><div class="msg <?php echo e($flash['type']); ?>"><?php echo e($flash['message']); ?></div><?php endif; ?>
+
+            <section id="section-overview" class="teacher-section active">
+                <div class="admin-overview-head">
+                    <h3 class="teacher-card-title admin-overview-title">Your overview</h3>
+                    <p class="admin-overview-lead">See your enrollment, open subjects, quizzes, and results at a glance. Jump to any workspace with the cards or shortcuts below.</p>
+                </div>
+
+                <div class="admin-overview-stat-grid">
+                    <a href="#section-subjects" class="admin-stat-card admin-stat-card--link" data-student-section="section-subjects">
+                        <div class="admin-stat-card-inner">
+                            <div class="admin-stat-icon admin-stat-icon--subjects" aria-hidden="true">C</div>
+                            <div class="admin-stat-body">
+                                <span class="admin-stat-label">Enrolled subjects</span>
+                                <strong class="admin-stat-value"><?php echo count($enrolledSubjects); ?></strong>
+                                <span class="admin-stat-hint">Courses you are approved for</span>
+                            </div>
+                        </div>
+                    </a>
+                    <a href="#section-discover" class="admin-stat-card admin-stat-card--link" data-student-section="section-discover">
+                        <div class="admin-stat-card-inner">
+                            <div class="admin-stat-icon admin-stat-icon--students" aria-hidden="true">D</div>
+                            <div class="admin-stat-body">
+                                <span class="admin-stat-label">Open to join</span>
+                                <strong class="admin-stat-value"><?php echo count($discoverSubjects); ?></strong>
+                                <span class="admin-stat-hint">Subjects you can request</span>
+                            </div>
+                        </div>
+                    </a>
+                    <a href="#section-quizzes" class="admin-stat-card admin-stat-card--link" data-student-section="section-quizzes">
+                        <div class="admin-stat-card-inner">
+                            <div class="admin-stat-icon admin-stat-icon--quizzes" aria-hidden="true">Q</div>
+                            <div class="admin-stat-body">
+                                <span class="admin-stat-label">Available quizzes</span>
+                                <strong class="admin-stat-value"><?php echo count($quizRows); ?></strong>
+                                <span class="admin-stat-hint">From your enrolled subjects</span>
+                            </div>
+                        </div>
+                    </a>
+                    <a href="#section-results" class="admin-stat-card admin-stat-card--link" data-student-section="section-results">
+                        <div class="admin-stat-card-inner">
+                            <div class="admin-stat-icon admin-stat-icon--attempts" aria-hidden="true">A</div>
+                            <div class="admin-stat-body">
+                                <span class="admin-stat-label">Completed attempts</span>
+                                <strong class="admin-stat-value"><?php echo count($attemptRows); ?></strong>
+                                <span class="admin-stat-hint">Finished &amp; graded runs</span>
+                            </div>
+                        </div>
+                    </a>
+                    <div class="admin-stat-card">
+                        <div class="admin-stat-card-inner">
+                            <div class="admin-stat-icon admin-stat-icon--teachers" aria-hidden="true">P</div>
+                            <div class="admin-stat-body">
+                                <span class="admin-stat-label">Pending requests</span>
+                                <strong class="admin-stat-value"><?php echo $studentPendingRequests; ?></strong>
+                                <span class="admin-stat-hint">Awaiting teacher review</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="admin-stat-card">
+                        <div class="admin-stat-card-inner">
+                            <div class="admin-stat-icon admin-stat-icon--users" aria-hidden="true">%</div>
+                            <div class="admin-stat-body">
+                                <span class="admin-stat-label">Average score</span>
+                                <strong class="admin-stat-value"><?php echo $studentAvgPct !== null ? $studentAvgPct . '%' : '—'; ?></strong>
+                                <span class="admin-stat-hint"><?php echo $studentAvgPct !== null ? 'Across completed quizzes' : 'Complete a quiz to see this'; ?></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="admin-overview-panels">
+                    <?php if ($studentPendingRequests > 0): ?>
+                    <div class="card admin-overview-priority">
+                        <div class="admin-overview-priority-copy">
+                            <span class="admin-overview-priority-kicker">Waiting on teachers</span>
+                            <strong class="admin-overview-priority-title"><?php echo $studentPendingRequests; ?> join request<?php echo $studentPendingRequests === 1 ? '' : 's'; ?> pending</strong>
+                            <p class="admin-overview-priority-text">Teachers approve access per subject. You can browse discoverable subjects or enter a code while you wait.</p>
+                        </div>
+                        <a href="#section-discover" class="button success small admin-overview-priority-cta" data-student-section="section-discover">View subjects</a>
+                    </div>
+                    <?php endif; ?>
+
+                    <div class="card admin-overview-quick-card">
+                        <h4 class="admin-overview-quick-heading">Shortcuts</h4>
+                        <ul class="admin-overview-quick-list">
+                            <li><a href="#section-join" data-student-section="section-join">Join by code</a></li>
+                            <li><a href="#section-discover" data-student-section="section-discover">Discover subjects<?php if ($studentPendingRequests > 0): ?> <span class="admin-quick-badge"><?php echo $studentPendingRequests; ?></span><?php endif; ?></a></li>
+                            <li><a href="#section-subjects" data-student-section="section-subjects">My subjects</a></li>
+                            <li><a href="#section-quizzes" data-student-section="section-quizzes">Take a quiz</a></li>
+                            <li><a href="#section-results" data-student-section="section-results">My results</a></li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <section id="section-join" class="teacher-section">
+                <div class="card">
+                    <h3 class="teacher-card-title">Join Subject by Code</h3>
+                    <form method="post" class="teacher-form">
+                        <input type="hidden" name="action" value="join_by_code">
+                        <label>Subject Code</label>
+                        <input type="text" name="subject_code" required>
+                        <button class="button success" type="submit">Send Join Request</button>
+                    </form>
+                </div>
+            </section>
+
+            <section id="section-discover" class="teacher-section">
+                <div class="card">
+                    <h3 class="teacher-card-title">Discover Subjects</h3>
+                    <?php if (!$discoverSubjects): ?><p class="teacher-empty">No available subjects at the moment.</p><?php endif; ?>
+                    <?php foreach ($discoverSubjects as $subject): ?>
+                        <div class="request-item">
+                            <div>
+                                <p class="request-main"><strong><?php echo e($subject['name']); ?></strong> (<?php echo e($subject['subject_code']); ?>)</p>
+                                <p class="request-sub">Teacher: <?php echo e($subject['teacher_name']); ?></p>
+                            </div>
+                            <form method="post">
+                                <input type="hidden" name="action" value="request_subject">
+                                <input type="hidden" name="subject_id" value="<?php echo (int)$subject['id']; ?>">
+                                <button class="button small" type="submit">Request Access</button>
+                            </form>
                         </div>
                     <?php endforeach; ?>
-                    <div class="mark-read-area">
-<a href="?action=mark_read&ids=<?php echo implode(',', array_column($notifications, 'id')); ?>" class="mark-all-read-btn">Mark All As Read</a>
-</div>
-                <?php else: ?>
-                    <div class="notification-item no-announcements">No new announcements.</div>
-                <?php endif; ?>
-            </div>
-        </div>
-        <a href="#" class="button danger logout-trigger" onclick="showLogoutModal(); return false;">Logout</a>
-    </div>
-</div>
-
-    <?php if ($message): ?><div class="msg err"><?php echo e($message); ?></div><?php endif; ?>
-    
-    <?php if ($display_quote_and_results): ?>
-    <div class="container wide">
-        <div class="card">
-            <h2>🎉 Quiz Results: "<?php echo e($last_quiz_title); ?>"</h2>
-            <div style="font-size: 3rem; color: var(--primary); text-align: center; margin: 1rem 0;">
-                <?php echo e($last_quiz_score); ?> / <?php echo e($last_quiz_total); ?>
-            </div>
-            <div class="msg success" style="font-style: italic; font-size: 1.1rem;">
-                "<?php echo e($random_quote); ?>"
-            </div>
-            <?php if ($award_stars): ?>
-            <div style="text-align: center; margin: 2rem 0;">
-                <h3>⭐ Excellent Work! ⭐</h3>
-                <div style="font-size: 4rem; color: gold;">★ ★ ★</div>
-            </div>
-            <?php endif; ?>
-            <div class="actions">
-                <a href="student_dashboard.php" class="button primary">Back to Dashboard</a>
-            </div>
-        </div>
-    </div>
-    <?php endif; ?>
-    
-<div class="container wide">
-        <div class="main-content-card">
-            <div class="dashboard-grid">
-                <div class="card">
-                    <h3>📚 Available Quizzes</h3>
-                    
-                    <div class="card" style="background: #eff6ff; border-color: #93c5fd;">
-                        <form method="post" style="display: flex; gap: 1rem; align-items: center;">
-                            <input type="hidden" name="action" value="join_quiz">
-                            <input type="text" name="join_code" placeholder="Enter Private Quiz Code" style="flex: 1;">
-                            <button type="submit" class="button success">Join Quiz</button>
-                        </form>
-                    </div>
-
-                    <?php if (empty($quizzes)): ?>
-                        <p class="msg">No public quizzes available. Ask for a private code!</p>
-                    <?php else: ?>
-                        <ul class="quiz-list-colorful">
-                            <?php foreach ($quizzes as $quiz): ?>
-                                <li class="<?php echo get_quiz_subject_class($quiz['title']); ?>">
-                                    <div class="quiz-info">
-                                        <span class="quiz-icon">
-                                            <?php 
-                                            $subject_class = get_quiz_subject_class($quiz['title']);
-                                            $icon_map = [
-                                                'science' => 'fas fa-flask',
-                                                'math' => 'fas fa-calculator', 
-                                                'art' => 'fas fa-palette',
-                                                'history' => 'fas fa-book-open'
-                                            ];
-                                            $icon = $icon_map[strpos($subject_class, key($icon_map)) !== false ? key($icon_map) : 'question-circle'] ?? 'fas fa-question-circle';
-                                            echo "<i class='$icon'></i>";
-                                            ?>
-                                        </span>
-                                        <div class="quiz-details">
-                                            <strong><?php echo e($quiz['title']); ?></strong>
-                                            <p><?php echo e($quiz['description']); ?></p>
-                                        </div>
-                                    </div>
-                                    <a href="quiz.php?quiz_id=<?php echo e($quiz['id']); ?>" class="button primary">Start Quiz</a>
-                                </li>
-                            <?php endforeach; ?>
-                        </ul>
-                    <?php endif; ?>
                 </div>
-                
+            </section>
+
+            <section id="section-subjects" class="teacher-section">
                 <div class="card">
-                    <h3>📄 Study Printables</h3>
-                    <p style="color: var(--text-2); margin-bottom: 1rem;">Review completed quizzes</p>
-                    
-                    <?php if (empty($completed_quizzes)): ?>
-                        <div class="msg">Complete a quiz to unlock study materials!</div>
-                    <?php else: ?>
-                        <ul style="list-style: none; padding: 0;">
-                            <?php foreach ($completed_quizzes as $quiz): ?>
-                                <li style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 0; border-bottom: 1px solid var(--border);">
-                                    <span><i class="fas fa-file-pdf" style="color: var(--primary); margin-right: 0.5rem;"></i><?php echo e($quiz['title']); ?></span>
-                                    <a href="generate_printables.php?quiz_id=<?php echo e($quiz['id']); ?>" class="button success small" target="_blank">
-                                        <i class="fas fa-download"></i> PDF
-                                    </a>
-                                </li>
-                            <?php endforeach; ?>
-                        </ul>
-                        <div class="msg" style="margin-top: 1rem; font-size: 0.875rem;">
-                            * Contains questions + answers for study
+                    <h3 class="teacher-card-title">My Enrolled Subjects</h3>
+                    <?php if (!$enrolledSubjects): ?><p class="teacher-empty">No enrolled subjects yet.</p><?php endif; ?>
+                    <?php foreach ($enrolledSubjects as $subject): ?>
+                        <div class="request-item">
+                            <div>
+                                <p class="request-main"><strong><?php echo e($subject['name']); ?></strong></p>
+                                <p class="request-sub">Teacher: <?php echo e($subject['teacher_name']); ?> · Code: <?php echo e($subject['subject_code']); ?></p>
+                            </div>
                         </div>
-                    <?php endif; ?>
+                    <?php endforeach; ?>
                 </div>
-                
+            </section>
+
+            <section id="section-quizzes" class="teacher-section">
                 <div class="card">
-                    <h3>🏆 Leaderboard</h3>
-                    <?php if (empty($ranking)): ?>
-                        <p>No results yet.</p>
-                    <?php else: ?>
-                        <ul class="ranking-list" style="list-style: none; padding: 0;">
-                            <?php $rank = 1; foreach ($ranking as $entry): ?>
-                                <li style="display: flex; align-items: center; padding: 0.75rem 0; border-bottom: 1px solid var(--border);">
-                                    <div style="width: 2rem; font-weight: 700; font-size: 1.1rem; color: <?php echo $rank <= 3 ? '#facc15' : 'var(--text-2)'; ?>">
-                                        <?php echo $rank; ?>
-                                    </div>
-                                    <span style="flex: 1; font-weight: 500;"><?php echo e($entry['name']); ?></span>
-                                    <span style="font-weight: 600; color: var(--primary);"><?php echo e($entry['score']); ?> pts</span>
-                                    <small style="color: var(--text-2);"><?php echo format_duration($entry['duration_seconds']); ?></small>
-                                </li>
-                            <?php $rank++; endforeach; ?>
-                        </ul>
-                    <?php endif; ?>
+                    <h3 class="teacher-card-title">Available Quizzes</h3>
+                    <?php if (!$quizRows): ?><p class="teacher-empty">No quizzes available yet.</p><?php endif; ?>
+                    <?php foreach ($quizRows as $quiz): ?>
+                        <div class="quiz-item">
+                            <p class="quiz-title"><?php echo e($quiz['title']); ?></p>
+                            <p class="quiz-meta"><?php echo e($quiz['subject_name']); ?></p>
+                            <p class="request-sub"><?php echo e($quiz['description'] ?: 'No description provided.'); ?></p>
+                            <p class="request-sub">Time limit: <?php echo (int)$quiz['time_limit']; ?> mins · Attempt limit: <?php echo (int)$quiz['attempt_limit']; ?></p>
+                            <a class="button primary small" href="quiz.php?quiz_id=<?php echo (int)$quiz['id']; ?>">Take Quiz</a>
+                        </div>
+                    <?php endforeach; ?>
                 </div>
-            </div>
+            </section>
+
+            <section id="section-results" class="teacher-section">
+                <div class="card">
+                    <h3 class="teacher-card-title">My Results</h3>
+                    <div class="table-scroll student-results-scroll">
+                        <table class="minimal-table student-results-table">
+                            <thead><tr><th>Quiz</th><th>Score</th><th>Submitted</th></tr></thead>
+                            <tbody>
+                            <?php foreach ($attemptRows as $attempt): ?>
+                                <tr>
+                                    <td><?php echo e($attempt['quiz_title']); ?></td>
+                                    <td><?php echo e($attempt['score']); ?> / <?php echo e($attempt['total_points']); ?></td>
+                                    <td><?php echo e($attempt['submitted_at']); ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
         </div>
-    </div>
-    <script>
-    // 1. Get the bell icon and the dropdown by their specific IDs
-    const bellIcon = document.getElementById('notification-bell');
-    const dropdown = document.getElementById('notification-dropdown');
-
-    // 2. Check if both elements exist before adding the listener
-    if (bellIcon && dropdown) {
-        // Toggle the 'show' class when the bell icon is clicked
-        bellIcon.addEventListener('click', function(event) {
-            event.preventDefault(); // Stop the link from navigating/reloading
-            dropdown.classList.toggle('show');
-        });
-    }
-
-    // 3. Close the dropdown if the user clicks outside of it
-    window.addEventListener('click', function(event) {
-        // Check if the dropdown exists, is currently open, and the click target is NOT inside the .notification-container
-        if (dropdown && dropdown.classList.contains('show') && !event.target.closest('.notification-container')) {
-            dropdown.classList.remove('show');
-        }
-    });
-</script>
-
-<?php include 'components/logout_modal.php'; ?>
+    </main>
+</div>
 
 <script>
-function showLogoutModal() {
-  const modal = document.getElementById('logoutModal');
-  if (modal) modal.classList.add('show');
+const navItems = document.querySelectorAll('.teacher-nav-item[data-target]');
+const sections = document.querySelectorAll('.teacher-section');
+
+function activateStudentSection(sectionId) {
+    if (!sectionId || !document.getElementById(sectionId)) {
+        return;
+    }
+    navItems.forEach(i => i.classList.remove('active'));
+    sections.forEach(s => s.classList.remove('active'));
+    const navFor = document.querySelector('.teacher-nav-item[data-target="' + sectionId + '"]');
+    if (navFor) {
+        navFor.classList.add('active');
+    }
+    document.getElementById(sectionId).classList.add('active');
 }
-function closeLogoutModal() {
-  const modal = document.getElementById('logoutModal');
-  if (modal) modal.classList.remove('show');
-}
-document.addEventListener('click', e => {
-  const modal = document.getElementById('logoutModal');
-  if (e.target.id === 'logoutModal' && modal) closeLogoutModal();
+
+navItems.forEach(item => {
+    item.addEventListener('click', function(e) {
+        const targetId = item.dataset.target;
+        if (!targetId) {
+            return;
+        }
+        e.preventDefault();
+        activateStudentSection(targetId);
+        history.replaceState(null, '', '#' + targetId);
+    });
 });
-const logoutBtn = document.querySelector('.logout-trigger');
-if (logoutBtn) logoutBtn.addEventListener('click', e => {
-  e.preventDefault();
-  showLogoutModal();
+
+document.querySelectorAll('[data-student-section]').forEach(function(el) {
+    el.addEventListener('click', function(e) {
+        const targetId = el.getAttribute('data-student-section');
+        if (!targetId) {
+            return;
+        }
+        e.preventDefault();
+        activateStudentSection(targetId);
+        history.replaceState(null, '', '#' + targetId);
+    });
+});
+
+window.addEventListener('DOMContentLoaded', function() {
+    const hash = (location.hash || '').replace(/^#/, '');
+    if (hash && document.getElementById(hash)) {
+        activateStudentSection(hash);
+    }
 });
 </script>
 </body>

@@ -1,0 +1,9 @@
+[2026-05-07 20:03:24] Verify your account
+To: jams@wmsu.edu.ph
+Link: http://localhost/CodeQuest/verify-email.php?token=fdaa54c02e9fa99f66d63c5349c7f3d669cc127d7a4c60e8bfbfbfbdad00ce5d
+Role: student
+
+[2026-05-08 03:56:49] Password reset
+To: jams@wmsu.edu.ph
+Link: http://localhost/CodeQuest/reset-password.php?token=ea1b7df3e342e51336d51b3ab1d49d0cdf9753e2359f114d9a17916d9185496c
+

@@ -18,10 +18,10 @@ try {
     $data_stmt = $pdo->prepare("
         SELECT 
             q.question_text,
-            a.answer_text AS correct_answer_text,
+            ac.choice_text AS correct_answer_text,
             qz.title AS quiz_title
         FROM questions q
-        JOIN answers a ON a.question_id = q.id AND a.is_correct = 1
+        JOIN answer_choices ac ON ac.question_id = q.id AND ac.is_correct = 1
         JOIN quizzes qz ON qz.id = q.quiz_id
         WHERE q.quiz_id = ?
         ORDER BY q.id

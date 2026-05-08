@@ -1,274 +1,162 @@
-the<?php
+<?php
 require_once 'config.php';
-
-// --- PHPMailer Setup ---
-// These lines load the library. Ensure the 'PHPMailer' folder is in your project directory.
-use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\Exception;
-
-require 'PHPMailer/Exception.php';
-require 'PHPMailer/PHPMailer.php';
-require 'PHPMailer/SMTP.php';
-// -----------------------
-
-require_role('student');
-
-$quiz_id = (int)($_GET['quiz_id'] ?? 0);
-$user_id = $_SESSION['user_id'];
+require_student();
+$studentId = current_user_id();
+$quizId = (int)($_GET['quiz_id'] ?? 0);
 $error = '';
-$message = '';
 
-// Check if quiz exists and is active
-$quiz = $pdo->prepare("SELECT * FROM quizzes WHERE id = ? AND is_active = 1");
-$quiz->execute([$quiz_id]);
-$quiz_data = $quiz->fetch();
-
-if (!$quiz_data) {
-    redirect('student_dashboard.php');
-}
-
-// Check for existing unfinished attempt or start new one
-$result_stmt = $pdo->prepare("SELECT * FROM results WHERE user_id = ?");
-$result_stmt->execute([$_SESSION['user_id']]);
-$current_result = $result_stmt->fetch();
-
-if (!$current_result) {
-    // Start a new attempt
-    $pdo->prepare("INSERT INTO results (user_id, quiz_id, start_time) VALUES (?, ?, NOW())")->execute([$user_id, $quiz_id]);
-    $current_result = $pdo->lastInsertId();
-    $message = "Quiz started!";
-}
-
-$questions = $pdo->prepare("
-    SELECT q.id AS question_id, q.question_text, 
-            a.id AS answer_id, a.answer_text, a.is_correct
-    FROM questions q 
-    JOIN answers a ON q.id = a.question_id 
-    WHERE q.quiz_id = ? 
-    ORDER BY q.id, a.id
+$quiz = $pdo->prepare("
+    SELECT q.*, s.id AS subject_id
+    FROM quizzes q
+    INNER JOIN subjects s ON s.id = q.subject_id
+    WHERE q.id = ? AND q.is_active = 1
 ");
-$questions->execute([$quiz_id]);
-$quiz_questions = [];
-
-// Group answers by question
-while ($row = $questions->fetch()) {
-    $q_id = $row['question_id'];
-    if (!isset($quiz_questions[$q_id])) {
-        $quiz_questions[$q_id] = [
-            'text' => $row['question_text'],
-            'answers' => []
-        ];
-    }
-    $quiz_questions[$q_id]['answers'][] = [
-        'id' => $row['answer_id'],
-        'text' => $row['answer_text'],
-        'is_correct' => $row['is_correct']
-    ];
+$quiz->execute([$quizId]);
+$quizData = $quiz->fetch();
+if (!$quizData) {
+    redirect('student_dashboard.php');
 }
 
-// --- HANDLE FORM SUBMISSION ---
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'finish') {
-    $score = 0;
-    
-    // 1. Grading Logic
-    foreach ($quiz_questions as $q_id => $q_data) {
-        // Submitted answer is explicitly cast to integer
-        $submitted_answer_id = (int)($_POST["q{$q_id}"] ?? 0);
-        
-        foreach ($q_data['answers'] as $answer) {
-            if ($answer['id'] == $submitted_answer_id && $answer['is_correct']) {
-                $score++;
-                break;
-            }
-        }
-    }
-
-    // Update the result record in the database
-    $update_stmt = $pdo->prepare("UPDATE results SET end_time = NOW(), score = ?, is_finished = 1 WHERE user_id = ? AND quiz_id = ? AND is_finished = 0");
-    $update_stmt->execute([$score, $user_id, $quiz_id]);
-
-    // =========================================================
-    // 📧 SEND EMAIL NOTIFICATIONS (Student & Admin)
-    // =========================================================
-    
-    // 1. Get student details and set admin email
-    $user_stmt = $pdo->prepare("SELECT email, name FROM users WHERE id = ?");
-    $user_stmt->execute([$user_id]);
-    $student = $user_stmt->fetch();
-
-    $admin_email = ADMIN_EMAIL; // Using the constant from config.php
-    
-    if ($student && !empty($student['email'])) {
-        $mail = new PHPMailer(true);
-
-        try {
-            // Server Settings (Reusing your existing config)
-            $mail->isSMTP();
-            $mail->Host       = 'smtp.gmail.com'; 
-            $mail->SMTPAuth   = true; 
-            
-           
-            $mail->Username   = 'ae202403345@wmsu.edu.ph'; 
-            $mail->Password   = 'snab sflg fgfz cbhm'; 
-          
-
-            $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS; 
-            $mail->Port       = 587; 
-
-            // This option is good practice for testing/development
-            $mail->SMTPOptions = [
-                'ssl' => [
-                    'verify_peer' => false,
-                    'verify_peer_name' => false,
-                    'allow_self_signed' => true
-                ]
-            ];
-
-            // Sender Information
-            $mail->setFrom('no-reply@yourquizsystem.com', 'Quiz Admin');
-            
-            // Content Variables
-            $recipient_name = htmlspecialchars($student['name']);
-            $quiz_title = htmlspecialchars($quiz_data['title']);
-            $total_questions = count($quiz_questions);
-            $completion_time = date('Y-m-d H:i');
-
-
-            // 1. --- Student-specific content ---
-            $student_bodyContent = "<h2>Hello {$recipient_name}!</h2>";
-            $student_bodyContent .= "<p>You have successfully completed the quiz: <strong>{$quiz_title}</strong>.</p>";
-            $student_bodyContent .= "<h3>Your Score: {$score} / {$total_questions}</h3>";
-            $student_bodyContent .= "<p>Time of Completion: {$completion_time}</p>";
-            $student_bodyContent .= "<hr>";
-            $student_bodyContent .= "<p><em>Log in to your dashboard to see your full results and ranking.</em></p>";
-            
-            // 2. --- Admin-specific content (Notification) ---
-            $admin_bodyContent = "
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <style>
-                        body { font-family: sans-serif; background-color: #f7f7f7; }
-                        .container { max-width: 600px; margin: 20px auto; background-color: #ffffff; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-                        .header { background-color: #007bff; color: white; padding: 15px; text-align: center; }
-                        .content { padding: 20px; }
-                        .score { font-size: 28px; font-weight: bold; color: #28a745; display: block; margin: 10px 0; }
-                        .detail-label { font-weight: bold; color: #555; display: inline-block; width: 120px; }
-                    </style>
-                </head>
-                <body>
-                    <div class='container'>
-                        <div class='header'>
-                            <h2>New Quiz Submission Received</h2>
-                        </div>
-                        <div class='content'>
-                            <p><span class='detail-label'>Quiz Title:</span> {$quiz_title}</p>
-                            <p><span class='detail-label'>Student:</span> {$recipient_name} ({$student['email']})</p>
-                            <p style='margin-top: 20px;'><span class='detail-label'>Score:</span> <span class='score'>{$score} / {$total_questions}</span></p>
-                            <p><span class='detail-label'>Completed At:</span> {$completion_time}</p>
-                            <p style='margin-top: 30px; font-size: 0.9em; color: #777;'>
-                                Log in to the Admin Dashboard for full results.
-                            </p>
-                        </div>
-                    </div>
-                </body>
-                </html>
-            ";
-
-
-            // --- A. Send the Student Email ---
-            $mail->clearAllRecipients(); // Ensure a clean slate
-            $mail->addAddress($student['email'], $student['name']);
-            $mail->isHTML(true); 
-            $mail->Subject = "Your Quiz Results: " . $quiz_data['title'];
-            $mail->Body = $student_bodyContent;
-            $mail->AltBody = strip_tags($student_bodyContent); 
-            $mail->send();
-
-            // --- B. Send the Admin Email ---
-            if (filter_var($admin_email, FILTER_VALIDATE_EMAIL)) {
-                $mail->clearAllRecipients(); // Reset for the next recipient
-                $mail->addAddress($admin_email, 'Quiz System Admin');
-                $mail->isHTML(true); 
-                $mail->Subject = "[ADMIN] New Quiz Submission: " . $quiz_data['title'];
-                $mail->Body = $admin_bodyContent;
-                $mail->AltBody = "New Quiz Submission - Student: {$recipient_name} ({$student['email']}), Score: {$score}/{$total_questions}."; 
-                $mail->send();
-            }
-
-            
-        } catch (Exception $e) {
-            // Log error silently so the user is still redirected successfully
-            error_log("Quiz email notification failed. Mailer Error: {$mail->ErrorInfo}");
-        }
-    }
-    // =========================================================
-    // END EMAIL NOTIFICATION CODE
-    // =========================================================
-    
-    // Store results in session for display on dashboard
-    $_SESSION['quiz_submitted'] = true;
-    $_SESSION['last_quiz_score'] = $score;
-    $_SESSION['last_quiz_total'] = count($quiz_questions); 
-    $_SESSION['last_quiz_title'] = $quiz_data['title']; 
-
-    // Redirect to show results/dashboard
+$enrolled = $pdo->prepare("
+    SELECT id FROM subject_enrollments
+    WHERE subject_id = ? AND student_id = ? AND status = 'approved'
+");
+$enrolled->execute([(int)$quizData['subject_id'], $studentId]);
+if (!$enrolled->fetch()) {
+    set_flash('error', 'You are not enrolled in this subject.');
     redirect('student_dashboard.php');
+}
+
+$attemptCountStmt = $pdo->prepare("
+    SELECT COUNT(*) FROM quiz_attempts
+    WHERE quiz_id = ? AND student_id = ? AND is_finished = 1
+");
+$attemptCountStmt->execute([$quizId, $studentId]);
+$attemptCount = (int)$attemptCountStmt->fetchColumn();
+if ($attemptCount >= (int)$quizData['attempt_limit']) {
+    set_flash('error', 'Attempt limit reached for this quiz.');
+    redirect('student_dashboard.php');
+}
+
+$questionsStmt = $pdo->prepare("SELECT * FROM questions WHERE quiz_id = ? ORDER BY id");
+$questionsStmt->execute([$quizId]);
+$questions = $questionsStmt->fetchAll();
+
+$choicesStmt = $pdo->prepare("SELECT * FROM answer_choices WHERE question_id = ? ORDER BY id");
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'finish') {
+    $attemptNo = $attemptCount + 1;
+    $pdo->beginTransaction();
+    try {
+        $pdo->prepare("
+            INSERT INTO quiz_attempts (quiz_id, student_id, attempt_no, started_at, is_finished)
+            VALUES (?, ?, ?, NOW(), 0)
+        ")->execute([$quizId, $studentId, $attemptNo]);
+        $attemptId = (int)$pdo->lastInsertId();
+
+        $score = 0.0;
+        $total = 0;
+
+        foreach ($questions as $question) {
+            $qId = (int)$question['id'];
+            $qType = $question['question_type'];
+            $points = (int)$question['points'];
+            $total += $points;
+            $isCorrect = 0;
+            $awarded = 0;
+            $choiceId = null;
+            $shortAnswer = null;
+
+            $choicesStmt->execute([$qId]);
+            $choices = $choicesStmt->fetchAll();
+            $correctChoices = array_values(array_filter($choices, fn($c) => (int)$c['is_correct'] === 1));
+
+            if ($qType === 'short_answer') {
+                $shortAnswer = trim((string)($_POST['q_' . $qId] ?? ''));
+                $answerKey = strtolower(trim((string)($correctChoices[0]['choice_text'] ?? '')));
+                if ($shortAnswer !== '' && strtolower($shortAnswer) === $answerKey) {
+                    $isCorrect = 1;
+                    $awarded = $points;
+                }
+            } else {
+                $choiceId = (int)($_POST['q_' . $qId] ?? 0);
+                foreach ($correctChoices as $correct) {
+                    if ((int)$correct['id'] === $choiceId) {
+                        $isCorrect = 1;
+                        $awarded = $points;
+                        break;
+                    }
+                }
+            }
+
+            $score += $awarded;
+            $pdo->prepare("
+                INSERT INTO quiz_attempt_answers (attempt_id, question_id, choice_id, short_answer, is_correct, awarded_points)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ")->execute([$attemptId, $qId, $choiceId ?: null, $shortAnswer, $isCorrect, $awarded]);
+        }
+
+        $pdo->prepare("
+            UPDATE quiz_attempts
+            SET score = ?, total_points = ?, submitted_at = NOW(), is_finished = 1
+            WHERE id = ?
+        ")->execute([$score, $total, $attemptId]);
+
+        $pdo->commit();
+        set_flash('success', "Quiz submitted. Score: {$score} / {$total}");
+        redirect('student_dashboard.php');
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        $error = 'Failed to submit quiz.';
+    }
 }
 ?>
 <!doctype html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title><?php echo e($quiz_data['title']); ?> - Quiz</title>
+    <title><?php echo e($quizData['title']); ?></title>
     <link rel="stylesheet" href="styles.css">
-    
 </head>
-<body class="student">
-    <div class="header">
-        <h2><?php echo e($quiz_data['title']); ?></h2>
-        <a href="student_dashboard.php" class="button secondary">Back to Dashboard</a>
+<body class="teacher-page app-quiz-page">
+<div class="header quiz-take-header">
+    <div class="quiz-take-header-inner">
+        <h2><?php echo e($quizData['title']); ?></h2>
+        <a href="student_dashboard.php" class="button secondary small">← Back</a>
     </div>
-
-    <div class="container wide quiz-view">
-        <p class="quiz-desc"><?php echo e($quiz_data['description']); ?></p>
-
-        <form method="post" id="quiz-form">
-            
-            <div id="question-tracker" class="question-tracker"></div>
-            
-            <div id="questions-wrapper">
-                <?php $q_index = 0; ?>
-                <?php foreach ($quiz_questions as $q_id => $q_data): ?>
-                    <div class="question-block" data-question-index="<?php echo $q_index; ?>"> 
-                        <div class="question-header">
-                            <span class="q-number">Question <?php echo $q_index + 1; ?>:</span>
-                            <h3 class="q-text"><?php echo e($q_data['text']); ?></h3>
-                        </div>
-
-                        <div class="answers-group">
-                            <?php foreach ($q_data['answers'] as $answer): ?>
-                                <label class="answer-option">
-                                    <input type="radio" name="q<?php echo e($q_id); ?>" value="<?php echo e($answer['id']); ?>" required>
-                                    <span class="answer-text"><?php echo e($answer['text']); ?></span>
-                                </label>
-                            <?php endforeach; ?>
-                        </div>
+</div>
+<div class="container wide teacher-wrap quiz-take-wrap">
+    <?php if ($error): ?><div class="msg err"><?php echo e($error); ?></div><?php endif; ?>
+    <?php if (trim((string)$quizData['description']) !== ''): ?>
+        <p class="quiz-take-intro"><?php echo e($quizData['description']); ?></p>
+    <?php endif; ?>
+    <form method="post" class="quiz-take-form">
+        <input type="hidden" name="action" value="finish">
+        <?php foreach ($questions as $index => $question): ?>
+            <?php
+            $choicesStmt->execute([(int)$question['id']]);
+            $choices = $choicesStmt->fetchAll();
+            ?>
+            <div class="card quiz-question-card">
+                <h3 class="quiz-question-title">Q<?php echo $index + 1; ?>. <?php echo e($question['question_text']); ?> <span class="quiz-question-points"><?php echo (int)$question['points']; ?> pt</span></h3>
+                <?php if ($question['question_type'] === 'short_answer'): ?>
+                    <input type="text" class="quiz-text-answer" name="q_<?php echo (int)$question['id']; ?>" required placeholder="Your answer">
+                <?php else: ?>
+                    <div class="quiz-choice-list">
+                    <?php foreach ($choices as $choice): ?>
+                        <label class="quiz-choice">
+                            <input type="radio" name="q_<?php echo (int)$question['id']; ?>" value="<?php echo (int)$choice['id']; ?>" required>
+                            <span><?php echo e($choice['choice_text']); ?></span>
+                        </label>
+                    <?php endforeach; ?>
                     </div>
-                    <?php $q_index++; ?>
-                <?php endforeach; ?>
+                <?php endif; ?>
             </div>
-
-            <div class="actions center-actions quiz-nav-buttons">
-                <button type="button" id="prev-btn" class="button secondary large-button" style="display: none;">Previous</button>
-                <button type="button" id="next-btn" class="button primary large-button">Next Question</button>
-                
-                <button type="submit" id="finish-btn" class="button success large-button" style="display: none;">Finish Quiz and Submit</button>
-                
-                <input type="hidden" name="action" value="finish">
-            </div>
-            
-        </form>
-    </div>
+        <?php endforeach; ?>
+        <div class="quiz-submit-row">
+            <button class="button success" type="submit">Submit Quiz</button>
+        </div>
+    </form>
+</div>
 </body>
 </html>

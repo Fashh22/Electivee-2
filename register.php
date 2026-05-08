@@ -2,28 +2,46 @@
 require_once 'config.php';
 
 if (is_logged_in()) {
-    redirect(get_user_role() === 'admin' ? 'admin_dashboard.php' : 'student_dashboard.php');
+    redirect(dashboard_for_role(get_user_role()));
 }
 
 $error = '';
 $success = '';
+$verificationLink = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $name = trim($_POST['name'] ?? '');
     $email = trim($_POST['email'] ?? '');
     $pass = $_POST['password'] ?? '';
-    $role = 'student'; // Default role for registration
+    $role = 'student';
 
-    if ($name && $email && $pass) {
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $error = 'Please provide a valid email address.';
+    } elseif (!preg_match('/@wmsu\.edu\.ph$/i', $email)) {
+        $error = 'Only @wmsu.edu.ph email addresses are allowed.';
+    } elseif (strlen($pass) < 8) {
+        $error = 'Password must be at least 8 characters.';
+    } elseif ($name && $email && $pass) {
         $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ?");
         $stmt->execute([$email]);
         if ($stmt->fetch()) {
             $error = 'Email already exists.';
         } else {
             $hash = password_hash($pass, PASSWORD_DEFAULT);
-            $stmt = $pdo->prepare("INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)");
-            if ($stmt->execute([$name, $email, $hash, $role])) {
-                $success = 'Registration successful! You can now log in.';
+            $isApproved = 1;
+            $stmt = $pdo->prepare("
+                INSERT INTO users (name, email, password_hash, role, status, is_active, is_email_verified, is_approved)
+                VALUES (?, ?, ?, ?, 'pending', 1, 0, ?)
+            ");
+            if ($stmt->execute([$name, $email, $hash, $role, $isApproved])) {
+                $userId = (int)$pdo->lastInsertId();
+                $token = issue_email_verification_token($pdo, $userId, 30);
+                $verificationLink = APP_BASE_URL . '/verify-email.php?token=' . urlencode($token);
+                dev_mail_log(
+                    'Verify your account',
+                    "To: {$email}\nLink: {$verificationLink}\nRole: {$role}"
+                );
+                $success = 'Registration successful. Verify your email first using the dev link below.';
             } else {
                 $error = 'Something went wrong. Please try again.';
             }
@@ -79,11 +97,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <?php if ($success): ?>
                     <div class="msg success mb-2" style="padding: 1rem; border-radius: 8px; background: #dcfce7; color: #166534;">
                         <i class="fas fa-check-circle"></i> <?php echo e($success); ?> 
-                        <a href="login.php" style="color: #166534; font-weight: bold; text-decoration: underline;">Login now</a>
+                        <a href="login.php" style="color: #166534; font-weight: bold; text-decoration: underline;">Login</a>
                     </div>
+                    <?php if ($verificationLink): ?>
+                        <div class="msg" style="padding: 1rem; margin-top: .75rem;">
+                            <strong>Dev verification link:</strong><br>
+                            <a href="<?php echo e($verificationLink); ?>"><?php echo e($verificationLink); ?></a>
+                        </div>
+                    <?php endif; ?>
                 <?php endif; ?>
 
-                <form method="POST">
+                <form method="POST" class="login-auth-form">
                     <div class="input-group">
                         <label for="name">Full Name</label>
                         <div class="input-with-icon">
@@ -107,6 +131,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <input type="password" id="password" name="password" placeholder="Min. 8 characters" required>
                         </div>
                     </div>
+                    <p class="register-student-note">Faculty accounts are created by an administrator. This form is for students only.</p>
 
                     <button type="submit" class="btn-login-landing">
                         Create Account <i class="fas fa-user-plus"></i>

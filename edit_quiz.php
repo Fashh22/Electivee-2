@@ -46,7 +46,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             foreach ($answers as $index => $a_text) {
                 if (!empty($a_text)) {
                     $is_correct = ($index == $correct_index) ? 1 : 0;
-                    $pdo->prepare("INSERT INTO answers (question_id, answer_text, is_correct) VALUES (?, ?, ?)")
+                    $pdo->prepare("INSERT INTO answer_choices (question_id, choice_text, is_correct) VALUES (?, ?, ?)")
                         ->execute([$q_id, $a_text, $is_correct]);
                 }
             }
@@ -66,9 +66,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 // --- 3. Fetch Questions and Answers for Display ---
 $questions_stmt = $pdo->prepare("
-    SELECT q.id AS question_id, q.question_text, a.id AS answer_id, a.answer_text, a.is_correct
+    SELECT q.id AS question_id, q.question_text, a.id AS answer_id, a.choice_text AS answer_text, a.is_correct
     FROM questions q 
-    LEFT JOIN answers a ON q.id = a.question_id 
+    LEFT JOIN answer_choices a ON q.id = a.question_id 
     WHERE q.quiz_id = ? 
     ORDER BY q.id, a.id
 ");
@@ -95,13 +95,13 @@ while ($row = $questions_stmt->fetch()) {
     <title>Edit Quiz: <?php echo e($quiz['title']); ?></title>
     <link rel="stylesheet" href="styles.css">
 </head>
-<body>
-    <div class="header">
-        <h2>✏️ Editing Quiz: <?php echo e($quiz['title']); ?></h2>
-        <a href="admin_dashboard.php" class="button secondary">Back to Dashboard</a>
+<body class="teacher-page">
+    <div class="header teacher-header">
+        <h2>Edit quiz: <?php echo e($quiz['title']); ?></h2>
+        <a href="admin_dashboard.php" class="button secondary small">Back to Dashboard</a>
     </div>
 
-    <div class="container wide">
+    <div class="container wide teacher-wrap">
         <?php if ($error): ?><div class="msg err"><?php echo e($error); ?></div><?php endif; ?>
         <?php if ($message): ?><div class="msg success"><?php echo e($message); ?></div><?php endif; ?>
 
